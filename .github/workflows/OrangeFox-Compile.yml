@@ -88,8 +88,7 @@ jobs:
           /opt/hostedtoolcache/CodeQL \
           /usr/local/share/boost \
           /usr/local/share/chromium \
-          /opt/microsoft \
-          "$AGENT_TOOLSDIRECTORY" || true
+          /opt/microsoft || true
         sudo apt-get clean
         sudo docker image prune -a -f >/dev/null 2>&1 || true
         df -h /
@@ -97,19 +96,30 @@ jobs:
     - name: Swap Space
       uses: pierotofy/set-swap-space@master
       with:
-        swap-size-gb: 12
+        swap-size-gb: 20
 
     - name: Build Environment
       run: |
         set -euo pipefail
         sudo apt install aria2 ccache zstd -y
         ccache --version | head -1
+
+        # Fail here (in one second) instead of 4 minutes into the build if ccache is unusable.
+        echo 'int main(void){return 0;}' > /tmp/cctest.c
+        if ccache gcc -c /tmp/cctest.c -o /tmp/cctest.o; then
+          echo "ccache self-test: OK"
+          ccache --show-stats | head -5 || true
+        else
+          echo "::warning::ccache self-test FAILED - disabling ccache for this run"
+          echo "USE_CCACHE=0" >> "$GITHUB_ENV"
+        fi
+
         git clone https://gitlab.com/OrangeFox/misc/scripts.git -b master
         cd scripts
         sudo bash setup/android_build_env.sh
 
     # Restored/saved automatically (post-job step). Cold first run, then
-    # ~60-80% of objects come from cache, which is where the 40 min go.
+    # most objects come from cache, which is where the ~40 min go.
     - name: Restore ccache
       uses: actions/cache@v4
       with:
@@ -183,21 +193,56 @@ jobs:
       run: |
         cd "${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}"
         export ALLOW_MISSING_DEPENDENCIES=true
-        export CCACHE_EXEC=$(which ccache)
-        ccache --zero-stats || true
-        ccache --show-config || true
+        if [ "${USE_CCACHE:-1}" = "1" ]; then
+          export CCACHE_EXEC=$(which ccache)
+          ccache --zero-stats || true
+          ccache --show-config 2>/dev/null | tail -5 || true
+        fi
+
+        echo "=== free space / memory before build ==="
+        df -h / | tail -1; free -h | head -3
 
         set +e
-        source build/envsetup.sh
+        source build/envsetup.sh 2>&1 | tee -a "${GITHUB_WORKSPACE}/of-build.log"
         set -e
-        lunch twrp_${{ inputs.DEVICE_NAME }}-eng
+        lunch twrp_${{ inputs.DEVICE_NAME }}-eng 2>&1 | tee -a "${GITHUB_WORKSPACE}/of-build.log"
 
         # NOTE: no 'make clean' here - the workspace is always fresh, so it only
         # parsed the whole build system for a couple of minutes and did nothing.
         set -o pipefail
-        time mka ${{ inputs.BUILD_TARGET }}image 2>&1 | tee "${GITHUB_WORKSPACE}/of-build.log"
+        time mka ${{ inputs.BUILD_TARGET }}image 2>&1 | tee -a "${GITHUB_WORKSPACE}/of-build.log"
 
         ccache --show-stats || true
+
+    # Publicly visible annotations: this is how a failure can be diagnosed
+    # even when the job log itself needs a GitHub login.
+    - name: Failure report
+      if: failure()
+      run: |
+        set +e
+        echo "=== disk ==="; df -h /
+        echo "=== memory / swap ==="; free -h
+        echo "=== oom kills ==="; sudo dmesg 2>/dev/null | grep -iE "out of memory|killed process|oom" | tail -5
+
+        LOG="${GITHUB_WORKSPACE}/of-build.log"
+        if [ ! -f "$LOG" ]; then
+          echo "::error::No build log was produced - the step died before mka started (envsetup/lunch stage)."
+          exit 0
+        fi
+
+        echo "=== last 50 log lines ==="
+        tail -50 "$LOG"
+
+        echo "=== publishing error lines as annotations ==="
+        mapfile -t LINES < <(grep -nE "error:|fatal:|FAILED:|ninja: build stopped|No space left|Killed|undefined reference|cannot find -l|Permission denied|not found" "$LOG" | tail -12)
+        if [ "${#LINES[@]}" -eq 0 ]; then
+          echo "::error::mka failed without a recognisable error line - download artifact of-build-log"
+        else
+          for l in "${LINES[@]}"; do
+            echo "::error::${l:0:900}"
+          done
+        fi
+        exit 0
 
     - name: Upload build log
       if: always()
