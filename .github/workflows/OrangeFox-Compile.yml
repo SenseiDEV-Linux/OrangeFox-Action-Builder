@@ -202,10 +202,22 @@ jobs:
         echo "=== free space / memory before build ==="
         df -h / | tail -1; free -h | head -3
 
+        # IMPORTANT: envsetup.sh and lunch() MUST run in this very shell.
+        # Never pipe them ("source ... | tee") - the right side of a pipeline is a
+        # subshell, so the functions/env vars (lunch, mka, TARGET_PRODUCT) are lost
+        # and you get "line N: lunch: command not found".
         set +e
-        source build/envsetup.sh 2>&1 | tee -a "${GITHUB_WORKSPACE}/of-build.log"
+        source build/envsetup.sh >> "${GITHUB_WORKSPACE}/of-build.log" 2>&1
         set -e
-        lunch twrp_${{ inputs.DEVICE_NAME }}-eng 2>&1 | tee -a "${GITHUB_WORKSPACE}/of-build.log"
+
+        if ! type lunch >/dev/null 2>&1; then
+          echo "::error::build/envsetup.sh did not define lunch() - envsetup failed. Tail of its output:"
+          tail -n 20 "${GITHUB_WORKSPACE}/of-build.log"
+          exit 1
+        fi
+
+        lunch twrp_${{ inputs.DEVICE_NAME }}-eng >> "${GITHUB_WORKSPACE}/of-build.log" 2>&1
+        tail -n 15 "${GITHUB_WORKSPACE}/of-build.log"
 
         # NOTE: no 'make clean' here - the workspace is always fresh, so it only
         # parsed the whole build system for a couple of minutes and did nothing.
@@ -228,6 +240,10 @@ jobs:
         if [ ! -f "$LOG" ]; then
           echo "::error::No build log was produced - the step died before mka started (envsetup/lunch stage)."
           exit 0
+        fi
+
+        if grep -q "command not found" "$LOG"; then
+          echo "::error::envsetup.sh did not load: $(grep -m1 'command not found' "$LOG")"
         fi
 
         echo "=== last 50 log lines ==="
