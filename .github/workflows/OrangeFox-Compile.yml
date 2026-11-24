@@ -208,6 +208,55 @@ jobs:
           ccache-${{ runner.os }}-fox${{ inputs.MANIFEST_BRANCH }}-${{ inputs.DEVICE_NAME }}-${{ inputs.DEVICE_TREE_BRANCH }}-${{ inputs.BUILD_TARGET }}-bust${{ inputs.CCACHE_BUST }}-run-
           ccache-${{ runner.os }}-fox${{ inputs.MANIFEST_BRANCH }}-${{ inputs.DEVICE_NAME }}-
 
+    # ------------------------------------------------------------------
+    # minui: guard the ABS_MT_PRESSURE == 0 -> "finger up" inference.
+    # Without a guard here a panel that reports zero pressure mid-swipe makes
+    # the GUI emit a fake TOUCH_RELEASE, and GUIScrollList opens the folder
+    # that is still selected. Guarded by the same TW_IGNORE_MAJOR_AXIS_0 that
+    # BoardConfig.mk already sets (vendor/twrp/build/soong/Android.bp maps it
+    # to -DTW_IGNORE_MAJOR_AXIS_0 for libminuitwrp via twrp_defaults).
+    # Re-applied every run because orangefox_sync.sh re-clones bootable/recovery.
+    # ------------------------------------------------------------------
+    - name: Patch minui touch handling
+      run: |
+        set -euo pipefail
+        F="${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/bootable/recovery/minuitwrp/events.cpp"
+        test -f "$F" || { echo "::error::$F not found"; exit 1; }
+        if awk '/case ABS_MT_PRESSURE/{f=1} f&&/^#ifndef TW_IGNORE_MAJOR_AXIS_0$/{print "ok"; exit}' "$F" | grep -q ok; then
+          echo "already patched"
+        else
+          python3 - "$F" <<'PYEOF'
+        import sys
+        p = sys.argv[1]
+        s = open(p).read()
+        old = "\t\tcase ABS_MT_PRESSURE: //3a\n                    if (ev->value == 0)\n"
+        new = "\t\tcase ABS_MT_PRESSURE: //3a\n#ifndef TW_IGNORE_MAJOR_AXIS_0\n                    if (ev->value == 0)\n"
+        if s.count(old) != 1:
+            raise SystemExit("::error::ABS_MT_PRESSURE anchor not found exactly once - check bootable/recovery version")
+        s = s.replace(old, new)
+        close = "                touchReleaseOnNextSynReport = 1;\n            }\n"
+        i = s.index("case ABS_MT_PRESSURE")
+        j = s.index(close, i) + len(close)
+        s = s[:j] + "#endif\n" + s[j:]
+        open(p, "w").write(s)
+        print("patched " + p)
+        PYEOF
+        fi
+        echo "=== resulting block ==="
+        sed -n '/case ABS_MT_PRESSURE/,/break;/p' "$F" | head -14
+
+    - name: Verify touch flag reaches the compiler
+      run: |
+        set -uo pipefail
+        ROOT="${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}"
+        echo "=== BoardConfig.mk ==="
+        grep -n 'TW_IGNORE_MAJOR_AXIS_0' "$ROOT/${{ inputs.DEVICE_PATH }}/BoardConfig.mk" \
+          || echo "::warning::TW_IGNORE_MAJOR_AXIS_0 is NOT set in BoardConfig.mk - the guard below is inert"
+        echo "=== vendor/twrp: Make -> soong ==="
+        grep -n 'tw_ignore_major_axis_0' "$ROOT/vendor/twrp/config/BoardConfigSoong.mk" || true
+        echo "=== vendor/twrp: soong -> -D ==="
+        grep -n 'TW_IGNORE_MAJOR_AXIS_0' "$ROOT/vendor/twrp/build/soong/Android.bp" || true
+
     - name: Building OrangeFox
       run: |
         cd "${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}"
@@ -309,6 +358,20 @@ jobs:
           done
         fi
         exit 0
+
+    # The build log alone cannot answer this: -D flags live in the soong ninja
+    # files, not in mka's stdout.
+    - name: Check -DTW_IGNORE_MAJOR_AXIS_0 in soong ninja
+      if: always()
+      run: |
+        ROOT="${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}"
+        echo "=== ninja files ==="
+        ls -1 "$ROOT"/out/soong/*.ninja 2>/dev/null || echo "(no ninja files)"
+        if grep -l 'DTW_IGNORE_MAJOR_AXIS_0' "$ROOT"/out/soong/*.ninja 2>/dev/null; then
+          echo "OK: libminuitwrp compiled with -DTW_IGNORE_MAJOR_AXIS_0"
+        else
+          echo "::error::-DTW_IGNORE_MAJOR_AXIS_0 not found in out/soong/*.ninja - the BoardConfig value did not reach the compiler, so the events.cpp guard is inert"
+        fi
 
     - name: Upload build log
       if: always()
