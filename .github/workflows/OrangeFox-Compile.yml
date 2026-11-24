@@ -217,33 +217,89 @@ jobs:
     # to -DTW_IGNORE_MAJOR_AXIS_0 for libminuitwrp via twrp_defaults).
     # Re-applied every run because orangefox_sync.sh re-clones bootable/recovery.
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # bootable/recovery/minuitwrp/events.cpp
+    #
+    # vk_modify() decides "the finger went up" from two SYN_REPORTs arriving
+    # back to back, and relies on every EV_ABS event to break that pair. Six
+    # branches return early without clearing lastWasSynReport (default:, and
+    # the logging-only ABS_MT_SLOT / ORIENTATION / TOOL_TYPE / BLOB_ID /
+    # DISTANCE cases), so a frame carrying only such a code left the flag set
+    # and the next SYN_REPORT was read as a lift. The GUI then saw a phantom
+    # TOUCH_RELEASE immediately followed by TOUCH_START, which re-runs
+    # HitTestItem() and re-selects the row under the finger - and the next
+    # release opens it. Hence folders opening by themselves while scrolling.
+    #
+    # Re-applied every run: orangefox_sync.sh re-clones bootable/recovery.
+    # ------------------------------------------------------------------
     - name: Patch minui touch handling
       run: |
         set -euo pipefail
         F="${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/bootable/recovery/minuitwrp/events.cpp"
-        test -f "$F" || { echo "::error::$F not found"; exit 1; }
-        if awk '/case ABS_MT_PRESSURE/{f=1} f&&/^#ifndef TW_IGNORE_MAJOR_AXIS_0$/{print "ok"; exit}' "$F" | grep -q ok; then
-          echo "already patched"
-        else
-          python3 - "$F" <<'PYEOF'
+        test -f "$F" || { echo "::error::$F not found - check MANIFEST_BRANCH"; exit 1; }
+        python3 - "$F" <<'PYEOF'
         import sys
         p = sys.argv[1]
         s = open(p).read()
-        old = "\t\tcase ABS_MT_PRESSURE: //3a\n                    if (ev->value == 0)\n"
-        new = "\t\tcase ABS_MT_PRESSURE: //3a\n#ifndef TW_IGNORE_MAJOR_AXIS_0\n                    if (ev->value == 0)\n"
-        if s.count(old) != 1:
-            raise SystemExit("::error::ABS_MT_PRESSURE anchor not found exactly once - check bootable/recovery version")
-        s = s.replace(old, new)
-        close = "                touchReleaseOnNextSynReport = 1;\n            }\n"
-        i = s.index("case ABS_MT_PRESSURE")
-        j = s.index(close, i) + len(close)
-        s = s[:j] + "#endif\n" + s[j:]
+
+        # single marker for "this step already ran" - the stock file must not contain it
+        MARK = "lastWasSynReport = 0; // keep the SYN_REPORT pair honest"
+        if MARK in s:
+            print("already patched, nothing to do")
+            raise SystemExit(0)
+
+        # 1) guard the ABS_MT_PRESSURE == 0 release inference.
+        #    NOTE: TW_IGNORE_MAJOR_AXIS_0 already appears in the stock file (it guards
+        #    ABS_MT_TOUCH_MAJOR), so the test has to be anchored to this very case.
+        press = "\t\tcase ABS_MT_PRESSURE: //3a\n#ifndef TW_IGNORE_MAJOR_AXIS_0\n"
+        if press not in s:
+            old = "\t\tcase ABS_MT_PRESSURE: //3a\n                    if (ev->value == 0)\n"
+            if s.count(old) != 1:
+                raise SystemExit("::error::ABS_MT_PRESSURE anchor not found exactly once - check bootable/recovery version")
+            s = s.replace(old, old.replace("//3a\n", "//3a\n#ifndef TW_IGNORE_MAJOR_AXIS_0\n"))
+            close = "                touchReleaseOnNextSynReport = 1;\n            }\n"
+            k = s.index("case ABS_MT_PRESSURE")
+            m = s.index(close, k) + len(close)
+            s = s[:m] + "#endif\n" + s[m:]
+
+        # 2) default: must clear lastWasSynReport
+        anchor = "        default:\n            // This is an unhandled message, just skip it\n            return 1;\n"
+        repl = ("        default:\n            // This is an unhandled message, just skip it.\n"
+                "            //\n"
+                "            // lastWasSynReport MUST be cleared here. vk_modify() treats two\n"
+                "            // back-to-back SYN_REPORTs as a finger-up, and an EV_ABS event is\n"
+                "            // what normally breaks that pair. Returning early without the reset\n"
+                "            // lets a frame carrying only an unhandled code (ABS_MT_SLOT on a\n"
+                "            // type-B panel, for example) fake a lift -> phantom TOUCH_RELEASE\n"
+                "            // followed by TOUCH_START -> the row under the finger is re-selected\n"
+                "            // and the next release opens it.\n"
+                "            " + MARK + "\n            return 1;\n")
+        if s.count(anchor) != 1:
+            raise SystemExit("::error::default: anchor not found - check bootable/recovery version")
+        s = s.replace(anchor, repl)
+
+        # 3) the logging-only cases that also return early
+        for code in ("ABS_MT_ORIENTATION", "ABS_MT_TOOL_TYPE", "ABS_MT_BLOB_ID",
+                     "ABS_MT_DISTANCE", "ABS_MT_SLOT"):
+            a = s.find("case %s:" % code)
+            if a < 0:
+                continue
+            b = s.index("return 1;", a)
+            s = s[:b] + MARK + "\n\t\t\t" + s[b:]
+
         open(p, "w").write(s)
         print("patched " + p)
         PYEOF
+        echo "=== ABS_MT_PRESSURE branch ==="
+        sed -n '/case ABS_MT_PRESSURE/,/break;/p' "$F" | head -12
+        echo "=== default: branch ==="
+        sed -n '/^        default:/,/^        }/p' "$F" | tail -4
+        N=$(grep -c 'lastWasSynReport = 0;' "$F")
+        echo "lastWasSynReport resets: $N (stock file has 4)"
+        if [ "$N" -lt 10 ]; then
+          echo "::error::expected 10 lastWasSynReport resets, got $N - the patch did not apply"
+          exit 1
         fi
-        echo "=== resulting block ==="
-        sed -n '/case ABS_MT_PRESSURE/,/break;/p' "$F" | head -14
 
     - name: Verify touch flag reaches the compiler
       run: |
