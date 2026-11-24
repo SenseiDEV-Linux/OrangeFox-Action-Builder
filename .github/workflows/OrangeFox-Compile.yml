@@ -60,7 +60,6 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # ---- ccache: the main speed-up on repeated builds ----
       USE_CCACHE: 1
-      CCACHE_DIR: /home/runner/.ccache
       CCACHE_EXEC: /usr/bin/ccache
       CCACHE_MAXSIZE: 3G
       CCACHE_COMPRESS: 'true'
@@ -106,7 +105,7 @@ jobs:
 
         # Fail here (in one second) instead of 4 minutes into the build if ccache is unusable.
         echo 'int main(void){return 0;}' > /tmp/cctest.c
-        if ccache gcc -c /tmp/cctest.c -o /tmp/cctest.o; then
+        if CCACHE_DIR=/tmp/ccache-selftest ccache gcc -c /tmp/cctest.c -o /tmp/cctest.o; then
           echo "ccache self-test: OK"
           ccache --show-stats | head -5 || true
         else
@@ -117,17 +116,6 @@ jobs:
         git clone https://gitlab.com/OrangeFox/misc/scripts.git -b master
         cd scripts
         sudo bash setup/android_build_env.sh
-
-    # ccache is restored by prefix and saved under a unique key, so even a run that
-    # fails half-way leaves a usable cache for the next attempt.
-    - name: Restore ccache
-      uses: actions/cache/restore@v4
-      with:
-        path: /home/runner/.ccache
-        key: ccache-${{ runner.os }}-fox${{ inputs.MANIFEST_BRANCH }}-${{ inputs.DEVICE_NAME }}-${{ inputs.DEVICE_TREE_BRANCH }}-${{ inputs.BUILD_TARGET }}-bust${{ inputs.CCACHE_BUST }}-run-${{ github.run_id }}-${{ github.run_attempt }}
-        restore-keys: |
-          ccache-${{ runner.os }}-fox${{ inputs.MANIFEST_BRANCH }}-${{ inputs.DEVICE_NAME }}-${{ inputs.DEVICE_TREE_BRANCH }}-${{ inputs.BUILD_TARGET }}-bust${{ inputs.CCACHE_BUST }}-run-
-          ccache-${{ runner.os }}-fox${{ inputs.MANIFEST_BRANCH }}-${{ inputs.DEVICE_NAME }}-
 
     - name: Set-up Manifest
       run: |
@@ -209,42 +197,74 @@ jobs:
           fi
         done <<< "${{ inputs.EXTRA_REPOS }}"
 
+    # ccache is restored by prefix and saved under a unique key, so even a run that
+    # fails half-way leaves a usable cache for the next attempt.
+    - name: Restore ccache
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ github.workspace }}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/out/ccache
+        key: ccache-${{ runner.os }}-fox${{ inputs.MANIFEST_BRANCH }}-${{ inputs.DEVICE_NAME }}-${{ inputs.DEVICE_TREE_BRANCH }}-${{ inputs.BUILD_TARGET }}-bust${{ inputs.CCACHE_BUST }}-run-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          ccache-${{ runner.os }}-fox${{ inputs.MANIFEST_BRANCH }}-${{ inputs.DEVICE_NAME }}-${{ inputs.DEVICE_TREE_BRANCH }}-${{ inputs.BUILD_TARGET }}-bust${{ inputs.CCACHE_BUST }}-run-
+          ccache-${{ runner.os }}-fox${{ inputs.MANIFEST_BRANCH }}-${{ inputs.DEVICE_NAME }}-
+
     - name: Building OrangeFox
       run: |
         cd "${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}"
+        LOG="${GITHUB_WORKSPACE}/of-build.log"
         export ALLOW_MISSING_DEPENDENCIES=true
-        if [ "${USE_CCACHE:-1}" = "1" ]; then
-          export CCACHE_EXEC=$(which ccache)
-          ccache --zero-stats || true
-          ccache --show-config 2>/dev/null | tail -5 || true
-        fi
 
+        # soong runs every compile step inside an nsjail sandbox where "/" is
+        # mounted READ-ONLY; only out/, /tmp and dist/ are bind-mounted read-write.
+        # That is why CCACHE_DIR=$HOME/.ccache died with
+        #   ccache: error: Failed to create directory /home/runner/.ccache/tmp:
+        #   Read-only file system
+        # AOSP's recommended fix: keep the cache inside out/.
+        export CCACHE_DIR="$PWD/out/ccache"
+        export CCACHE_EXEC=$(which ccache)
+        mkdir -p "$CCACHE_DIR"
+        ccache --max-size=${CCACHE_MAXSIZE} >/dev/null 2>&1 || true
+
+        echo "=== ccache dir: $CCACHE_DIR ==="
         echo "=== free space / memory before build ==="
-        df -h / | tail -1; free -h | head -3
+        df -h / | tail -1; df -i / | tail -1; free -h | head -3
 
         # IMPORTANT: envsetup.sh and lunch() MUST run in this very shell.
         # Never pipe them ("source ... | tee") - the right side of a pipeline is a
         # subshell, so the functions/env vars (lunch, mka, TARGET_PRODUCT) are lost
         # and you get "line N: lunch: command not found".
         set +e
-        source build/envsetup.sh >> "${GITHUB_WORKSPACE}/of-build.log" 2>&1
+        source build/envsetup.sh >> "$LOG" 2>&1
         set -e
 
         if ! type lunch >/dev/null 2>&1; then
           echo "::error::build/envsetup.sh did not define lunch() - envsetup failed. Tail of its output:"
-          tail -n 20 "${GITHUB_WORKSPACE}/of-build.log"
+          tail -n 20 "$LOG"
           exit 1
         fi
 
-        lunch twrp_${{ inputs.DEVICE_NAME }}-eng >> "${GITHUB_WORKSPACE}/of-build.log" 2>&1
-        tail -n 15 "${GITHUB_WORKSPACE}/of-build.log"
+        lunch twrp_${{ inputs.DEVICE_NAME }}-eng >> "$LOG" 2>&1
+        tail -n 15 "$LOG"
 
         # NOTE: no 'make clean' here - the workspace is always fresh, so it only
         # parsed the whole build system for a couple of minutes and did nothing.
         set -o pipefail
-        time mka ${{ inputs.BUILD_TARGET }}image 2>&1 | tee -a "${GITHUB_WORKSPACE}/of-build.log"
+        set +e
+        time mka ${{ inputs.BUILD_TARGET }}image 2>&1 | tee -a "$LOG"
+        RC=$?
 
-        ccache --show-stats || true
+        # Belt and braces: if ccache still cannot write, finish the build with the
+        # cache switched off instead of losing 40 minutes of compilation.
+        if [ "$RC" -ne 0 ] && grep -q "ccache: error" "$LOG"; then
+          echo "::warning::ccache cannot write inside the build sandbox - continuing with CCACHE_DISABLE=1 (slower, but the build completes)"
+          export CCACHE_DISABLE=1
+          time mka ${{ inputs.BUILD_TARGET }}image 2>&1 | tee -a "$LOG"
+          RC=$?
+        fi
+        set -e
+
+        ccache --show-stats 2>/dev/null | head -20 || true
+        exit "$RC"
 
     # Publicly visible annotations: this is how a failure can be diagnosed
     # even when the job log itself needs a GitHub login.
@@ -257,7 +277,7 @@ jobs:
         echo "=== oom kills ==="; sudo dmesg 2>/dev/null | grep -iE "out of memory|killed process|oom" | tail -5
 
         # these two lines are the ones that matter, keep them public
-        echo "::error::disk: $(df -h / | tail -1)"
+        echo "::error::disk: $(df -h / | tail -1) | inodes: $(df -i / | tail -1)"
         echo "::error::memory: $(free -h | sed -n 2p)"
 
         LOG="${GITHUB_WORKSPACE}/of-build.log"
@@ -266,8 +286,11 @@ jobs:
           exit 0
         fi
 
-        if grep -qE "No space left on device|Read-only file system" "$LOG"; then
-          echo "::error::OUT OF DISK SPACE: $(grep -m1 -E 'No space left on device|Read-only file system' "$LOG")"
+        if grep -q "No space left on device" "$LOG"; then
+          echo "::error::OUT OF DISK SPACE: $(grep -m1 'No space left on device' "$LOG")"
+        fi
+        if grep -q "Read-only file system" "$LOG"; then
+          echo "::error::READ-ONLY WRITE TARGET: $(grep -m1 'Read-only file system' "$LOG") - inside the soong nsjail only out/, /tmp and dist/ are writable"
         fi
         if grep -q "command not found" "$LOG"; then
           echo "::error::envsetup.sh did not load: $(grep -m1 'command not found' "$LOG")"
@@ -300,7 +323,7 @@ jobs:
       if: always()
       uses: actions/cache/save@v4
       with:
-        path: /home/runner/.ccache
+        path: ${{ github.workspace }}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/out/ccache
         key: ccache-${{ runner.os }}-fox${{ inputs.MANIFEST_BRANCH }}-${{ inputs.DEVICE_NAME }}-${{ inputs.DEVICE_TREE_BRANCH }}-${{ inputs.BUILD_TARGET }}-bust${{ inputs.CCACHE_BUST }}-run-${{ github.run_id }}-${{ github.run_attempt }}
 
     - name: Set Release Properties
